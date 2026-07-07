@@ -1436,10 +1436,13 @@ def send_tasks_now(cfg, cache, user_key: str, dest_chat_id: str | None = None,
     # tombol ✏️ cuma di DM — callback aksi memang khusus chat privat
     kb = None
     if dest == user_key:
-        todays, overdue, _ = split_tasks(list(tasks), today)
+        todays, overdue, others = split_tasks(list(tasks), today)
+        # semua task yang TAMPIL di pesan dapat tombol, urut sama dengan
+        # nomor di daftar; Telegram max 100 tombol — sisain buat "Task lain…"
+        shown = todays + overdue + others[:MAX_OTHERS]
         btns = [{"text": f"✏️ #{t.get('shortId')}",
                  "callback_data": f"act:{t.get('id')}"}
-                for t in (todays + overdue)[:8] if t.get("id")]
+                for t in shown[:96] if t.get("id")]
         rows_kb = [btns[i:i + 4] for i in range(0, len(btns), 4)]
         rows_kb.append([{"text": "✏️ Task lain…", "callback_data": "act:other"}])
         kb = {"inline_keyboard": rows_kb}
