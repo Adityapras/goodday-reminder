@@ -110,6 +110,9 @@ def get_config():
         "digest_gd_users": os.environ.get("DIGEST_GD_USERS", "").strip(),
         # token bot LAIN yang udah ada di group (kosong = pakai TELEGRAM_BOT_TOKEN)
         "digest_bot_token": os.environ.get("DIGEST_BOT_TOKEN", "").strip(),
+        # kill-switch digest — fitur DIMATIKAN dulu (keputusan user 2026-07-07);
+        # nyalain lagi: set DIGEST_ENABLED=1 di .env, tanpa ubah kode
+        "digest_enabled": os.environ.get("DIGEST_ENABLED", "0").strip() == "1",
         # admin yang meng-approve pendaftaran (chat_id Telegram, pisah koma)
         "admin_chat_ids": [x.strip() for x in
                            os.environ.get("ADMIN_CHAT_IDS", "").split(",") if x.strip()],
@@ -951,6 +954,11 @@ def collect_digest_entries(cfg, targets: list, today: str,
 
 def cmd_digest(cfg, args):
     """Kirim ringkasan tim (hari ini + telat aja) ke group/topic Telegram."""
+    if not cfg["digest_enabled"]:
+        # exit 0 biar cron ga spam error selama fitur dimatikan
+        print("⏸ Digest lagi dinonaktifkan (DIGEST_ENABLED=1 di .env buat "
+              "menyalakan lagi). Ga ada yang dikirim.")
+        return
     if not cfg["api_token"]:
         raise SystemExit("GOODDAY_API_TOKEN belum di-set.")
     chat_id = args.chat_id or cfg["digest_chat_id"]
@@ -1039,7 +1047,7 @@ HELP = (
     "• Tiap pagi: reminder task pribadi via DM (kalau udah /daftar).\n"
     # "• Tiap pagi: digest tim ke topic group.\n"
     "• Data selalu diambil live dari GoodDay — ga perlu sync manual;\n"
-    "  task baru langsung kebawa tiap /tasks atau /digest.\n\n"
+    "  task baru langsung kebawa tiap /tasks.\n\n"
     "<b>Arti label:</b>\n"
     "⏰ deadline hari ini · 🚀 mulai hari ini · ⚠️ lewat deadline\n"
     "🔴 Emergency · 🟠 Blocker · 🟡 High\n"
@@ -1491,6 +1499,11 @@ def send_detail(cfg, cache, chat_id: str, uid: str, thread_id=None) -> None:
 
 def send_digest_now(cfg, cache, chat_id: str, thread_id=None) -> None:
     """Bikin & kirim digest terbaru (dipicu /digest dari group/topic atau DM)."""
+    if not cfg["digest_enabled"]:
+        tg_send(cfg["bot_token"], chat_id,
+                "⏸ Fitur digest lagi dinonaktifkan sementara.",
+                thread_id=thread_id)
+        return
     targets = digest_targets(cfg)
     if not targets:
         tg_send(cfg["bot_token"], chat_id,
@@ -2052,30 +2065,31 @@ def cmd_bot(cfg, args):
 
     # daftar perintah biar muncul di menu "/" Telegram
     try:
+        dm_cmds = [
+            {"command": "daftar", "description": "Daftar pakai ID GoodDay kamu (approval admin)"},
+            {"command": "tasks", "description": "Task aktif kamu (🔥 = urgent)"},
+            {"command": "cari", "description": "Cari task kamu by nomor (#shortId)"},
+            {"command": "digest", "description": "Ringkasan tim: hari ini + telat"},
+            {"command": "gdusers", "description": "Daftar user GoodDay + id"},
+            {"command": "status", "description": "Status pendaftaran kamu"},
+            {"command": "batal", "description": "Batalkan input yang lagi ditunggu"},
+            {"command": "berhenti", "description": "Stop reminder pagi"},
+            {"command": "help", "description": "Bantuan & daftar perintah"},
+        ]
+        grp_cmds = [
+            {"command": "digest", "description": "Ringkasan tim: hari ini + telat"},
+            {"command": "tasks", "description": "Task aktif kamu (🔥 = urgent)"},
+            {"command": "status", "description": "Status pendaftaran kamu"},
+            {"command": "gdusers", "description": "Daftar user GoodDay + id"},
+            {"command": "help", "description": "Bantuan & daftar perintah"},
+        ]
+        if not cfg["digest_enabled"]:  # sembunyiin dari menu selama dimatikan
+            dm_cmds = [c for c in dm_cmds if c["command"] != "digest"]
+            grp_cmds = [c for c in grp_cmds if c["command"] != "digest"]
         tg_api(cfg["bot_token"], "setMyCommands", {
-            "commands": [
-                {"command": "daftar", "description": "Daftar pakai ID GoodDay kamu (approval admin)"},
-                {"command": "tasks", "description": "Task aktif kamu (🔥 = urgent)"},
-                {"command": "cari", "description": "Cari task kamu by nomor (#shortId)"},
-                {"command": "digest", "description": "Ringkasan tim: hari ini + telat"},
-                {"command": "gdusers", "description": "Daftar user GoodDay + id"},
-                {"command": "status", "description": "Status pendaftaran kamu"},
-                {"command": "batal", "description": "Batalkan input yang lagi ditunggu"},
-                {"command": "berhenti", "description": "Stop reminder pagi"},
-                {"command": "help", "description": "Bantuan & daftar perintah"},
-            ],
-            "scope": {"type": "all_private_chats"},
-        })
+            "commands": dm_cmds, "scope": {"type": "all_private_chats"}})
         tg_api(cfg["bot_token"], "setMyCommands", {
-            "commands": [
-                {"command": "digest", "description": "Ringkasan tim: hari ini + telat"},
-                {"command": "tasks", "description": "Task aktif kamu (🔥 = urgent)"},
-                {"command": "status", "description": "Status pendaftaran kamu"},
-                {"command": "gdusers", "description": "Daftar user GoodDay + id"},
-                {"command": "help", "description": "Bantuan & daftar perintah"},
-            ],
-            "scope": {"type": "all_group_chats"},
-        })
+            "commands": grp_cmds, "scope": {"type": "all_group_chats"}})
     except Exception as e:
         print(f"  ! setMyCommands gagal (lanjut aja): {e}", file=sys.stderr)
 

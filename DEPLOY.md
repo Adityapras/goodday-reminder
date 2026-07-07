@@ -82,6 +82,11 @@ Tes dari HP: kirim `/status` ke bot — harus dibalas.
 
 ## 5. Pasang cron (reminder pagi + digest)
 
+> ⏸ Fitur digest lagi DIMATIKAN (`DIGEST_ENABLED=0`, default). Baris cron
+> digest boleh tetap dipasang — selama dimatikan dia cuma nulis log
+> "dinonaktifkan" tanpa kirim apa-apa; begitu `DIGEST_ENABLED=1` langsung
+> jalan tanpa ubah cron.
+
 ```bash
 timedatectl        # CEK TIMEZONE! jam cron ikut server
 crontab -e
@@ -103,7 +108,7 @@ Kalau server **UTC** (07:00 & 07:05 WIB = 00:00 & 00:05 UTC):
 
 > Catatan UTC: Senin–Jumat WIB pagi = Minggu–Kamis malam UTC, makanya `0-4`.
 
-Tes kirim beneran sekali (opsional):
+Tes kirim beneran sekali (opsional, hanya kalau `DIGEST_ENABLED=1`):
 
 ```bash
 cd /opt/gd-reminder && python3 goodday_reminder.py digest   # cek muncul di topic group
@@ -121,7 +126,8 @@ cd /opt/gd-reminder && python3 goodday_reminder.py digest   # cek muncul di topi
 - [ ] `systemctl status goodday-bot` → active (running)
 - [ ] `/status`, `/tasks`, `/cari` dibalas dari HP
 - [ ] Bot di mesin lama sudah MATI (`pgrep -f goodday_reminder` = kosong)
-- [ ] Besok pagi: reminder DM + digest masuk ke topic (cek `reminder.log` kalau tidak)
+- [ ] Besok pagi: reminder DM masuk (cek `reminder.log` kalau tidak).
+      Digest baru ikut terkirim kalau `DIGEST_ENABLED=1`.
 
 ## Update versi berikutnya
 
