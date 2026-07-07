@@ -1,0 +1,27 @@
+# ============================================================
+# Contoh crontab untuk GoodDay Daily Reminder
+# Pasang dengan:  crontab -e   (lalu tempel salah satu baris)
+# Cek:            crontab -l
+# ============================================================
+
+# Ganti /path/ke/folder dengan lokasi asli script di server kamu.
+# Cek path python:  which python3
+
+# --- Tiap hari jam 07:00 (ikut timezone SERVER) ---
+0 7 * * * cd /path/ke/folder && /usr/bin/python3 goodday_reminder.py run >> reminder.log 2>&1
+
+# --- Hanya hari kerja (Senin–Jumat) jam 08:00 ---
+# 0 8 * * 1-5 cd /path/ke/folder && /usr/bin/python3 goodday_reminder.py run >> reminder.log 2>&1
+
+# --- Hari kerja 08:00, tanpa notif ke yang ga ada task ---
+# 0 8 * * 1-5 cd /path/ke/folder && /usr/bin/python3 goodday_reminder.py run --skip-empty >> reminder.log 2>&1
+
+# --- Digest tim ke group/topic (hari ini + telat aja), hari kerja 07:05 ---
+# butuh DIGEST_CHAT_ID (dan DIGEST_TOPIC_ID kalau pakai Topics) di .env
+5 7 * * 1-5 cd /path/ke/folder && /usr/bin/python3 goodday_reminder.py digest >> reminder.log 2>&1
+
+# CATATAN TIMEZONE:
+# Cron ikut timezone server, sedangkan filter "hari ini" di dalam script
+# udah dikunci ke Asia/Jakarta (WIB). Kalau server kamu UTC dan mau kirim
+# jam 07:00 WIB, pasang cron di jam 00:00 UTC.
+#   cek timezone server:  timedatectl   (atau)  date

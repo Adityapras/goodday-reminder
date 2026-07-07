@@ -1,0 +1,23 @@
+# Kredensial — JANGAN pernah di-commit
+.env
+
+# Database produksi & artefak runtime (termasuk backup-nya)
+*.db
+*.db.*
+*.db-wal
+*.db-shm
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Catatan kerja internal (nama tim, chat_id, kondisi DB) — lokal saja
+HANDOFF.md
+TODO.md
+
+# Claude Code lokal
+.claude/settings.local.json
+
+# macOS
+.DS_Store

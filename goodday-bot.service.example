@@ -1,0 +1,34 @@
+# ============================================================
+# systemd unit buat bot pendaftaran (long-polling) di server Linux
+#
+# Pasang:
+#   sudo cp goodday-bot.service.example /etc/systemd/system/goodday-bot.service
+#   (edit User & path dulu!)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now goodday-bot
+#
+# Cek:
+#   systemctl status goodday-bot
+#   journalctl -u goodday-bot -f
+# ============================================================
+
+[Unit]
+Description=GoodDay Reminder - bot pendaftaran Telegram (long-polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# GANTI: user non-root pemilik folder
+User=youruser
+# GANTI: lokasi folder script di server
+WorkingDirectory=/opt/gd-reminder
+ExecStart=/usr/bin/python3 -u /opt/gd-reminder/goodday_reminder.py bot
+Restart=always
+RestartSec=5
+
+# pengetatan ringan
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
