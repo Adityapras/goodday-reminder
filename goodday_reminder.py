@@ -51,6 +51,7 @@ import os
 import re
 import sys
 import json
+import uuid
 import html
 import time
 import sqlite3
@@ -179,6 +180,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         )
     """)
+    # aksi AI yang MENUNGGU KONFIRMASI user (tombol ✅/✖️). Payload = JSON list
+    # proposal yang sudah di-resolve + Opsifin-checked. nonce cegah klik basi.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_pending (
+            chat_id    TEXT PRIMARY KEY,
+            nonce      TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
 
 
@@ -241,6 +252,38 @@ def get_pending(conn, chat_id: str):
 
 def clear_pending(conn, chat_id: str) -> None:
     conn.execute("DELETE FROM pending_actions WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+
+
+def set_ai_pending(conn, chat_id: str, nonce: str, payload: str) -> None:
+    conn.execute(
+        "INSERT INTO ai_pending (chat_id, nonce, payload, created_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+        "nonce = excluded.nonce, payload = excluded.payload, "
+        "created_at = excluded.created_at",
+        (chat_id, nonce, payload, now_iso()))
+    conn.commit()
+
+
+def get_ai_pending(conn, chat_id: str):
+    """Return (nonce, payload_str) atau None kalau ga ada / kadaluarsa."""
+    row = conn.execute("SELECT * FROM ai_pending WHERE chat_id = ?",
+                       (chat_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(row["created_at"])).total_seconds()
+    except ValueError:
+        age = PENDING_TTL + 1
+    if age > PENDING_TTL:
+        clear_ai_pending(conn, chat_id)
+        return None
+    return row["nonce"], row["payload"]
+
+
+def clear_ai_pending(conn, chat_id: str) -> None:
+    conn.execute("DELETE FROM ai_pending WHERE chat_id = ?", (chat_id,))
     conn.commit()
 
 
@@ -1365,8 +1408,13 @@ def _ai_system_prompt(today, tasks, statuses, cfields) -> str:
         "udah kasih id/link. User boleh akses task apa pun by id/URL.\n"
         "- Butuh baca isi/status task dulu sebelum jawab? Panggil get_task dulu.\n"
         "- Untuk aksi (ganti status, comment, report time, story point, tanggal, "
-        "custom field) WAJIB panggil tool aksinya. JANGAN ngaku udah ngelakuin "
-        "sesuatu tanpa manggil tool. Boleh get_task dulu baru aksi.\n"
+        "custom field) WAJIB panggil tool aksinya. Tapi INGAT: tool aksi TIDAK "
+        "langsung mengubah data — dia cuma MENYIAPKAN aksi, lalu user harus pencet "
+        "tombol konfirmasi ✅. Jadi JANGAN bilang 'sudah/berhasil diubah'; bilang "
+        "aja aksinya udah disiapkan & minta user konfirmasi. Boleh get_task dulu "
+        "baru siapkan aksi.\n"
+        "- Cuma task milik Opsifin yang boleh diubah. Kalau tool balas task bukan "
+        "Opsifin (⛔), sampaikan apa adanya — jangan maksa.\n"
         "- Kalau user cuma nanya/ngobrol, jawab langsung.\n"
         "- Cuma tanya balik kalau BENER-BENER ambigu (mis. nilai status ga jelas). "
         "Kalau id/link udah ada, kerjain — jangan muter-muter.\n\n"
@@ -1434,8 +1482,35 @@ def _ai_task_summary(cfg, cache, t) -> str:
     return "\n".join(lines)
 
 
-def _ai_run_tool(cfg, row, cache, name, args) -> str:
-    """Eksekusi satu tool-call -> string hasil (HTML)."""
+def _ai_check_opsifin(cfg, task):
+    """(ok, reason). Task boleh DIUBAH hanya kalau Product Stream = Opsifin
+    (keputusan user 2026-07-08: selain Opsifin JANGAN diapa-apakan). Butuh
+    customFieldsData -> fetch detail kalau `task` cuma item assigned-list."""
+    cf = task.get("customFieldsData")
+    if cf is None:
+        try:
+            cf = (gd_task_detail(cfg["api_token"], task["id"])
+                  .get("customFieldsData") or {})
+        except Exception as e:
+            return False, f"ga bisa verifikasi Opsifin ({html.escape(str(e)[:80])})"
+    stream = cf.get(cfg["ready_stream_field"])
+    if stream is not None and _num_eq(stream, cfg["ready_stream_value"]):
+        return True, None
+    return False, ("task ini BUKAN punya Opsifin (Product Stream ≠ Opsifin) — "
+                   "sesuai aturan, ga boleh diubah lewat bot")
+
+
+def _ai_min_task(task) -> dict:
+    """Data task minimal buat disimpan di proposal (task['id'] dipakai act_*,
+    shortId+name buat label)."""
+    return {"id": task.get("id"), "shortId": task.get("shortId"),
+            "name": task.get("name")}
+
+
+def _ai_run_tool(cfg, row, cache, name, args, proposals) -> str:
+    """get_task: baca langsung (read-only). Tool AKSI: resolve + cek Opsifin +
+    validasi -> SIMPAN proposal, TIDAK menulis. Penulisan ke GoodDay baru terjadi
+    setelah user pencet tombol konfirmasi (_ai_exec_proposal)."""
     if name == "get_task":
         task, err = _ai_resolve_task(cfg, row, args.get("task_ref"))
         if err:
@@ -1445,6 +1520,15 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
     task, err = _ai_resolve_task(cfg, row, args.get("task_ref"))
     if err:
         return f"❌ {err}"
+    ok, why = _ai_check_opsifin(cfg, task)
+    if not ok:
+        return f"⛔ {why}."
+    lbl = task_label(task)
+
+    def propose(pargs, desc):
+        proposals.append({"tool": name, "task": _ai_min_task(task),
+                          "args": pargs, "desc": desc})
+        return f"🕘 Disiapkan (nunggu konfirmasi user): {desc}"
 
     if name == "update_status":
         want = (args.get("status_name") or "").strip().lower()
@@ -1457,13 +1541,15 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
         if not s:
             names = ", ".join(x.get("name") for x in opts if x.get("name"))
             return f"❌ Status '{args.get('status_name')}' ga dikenal. Pilihan: {names}"
-        return act_update_status(cfg, row, task, str(s.get("id")), s.get("name"))
+        return propose({"status_id": str(s.get("id")), "status_name": s.get("name")},
+                       f"🔄 Status {lbl} → <b>{html.escape(s.get('name') or '')}</b>")
 
     if name == "add_comment":
         msg = (args.get("message") or "").strip()
         if not msg:
             return "❌ Isi comment kosong."
-        return act_comment(cfg, row, task, msg)
+        return propose({"message": msg},
+                       f"💬 Comment ke {lbl}: “{html.escape(msg[:120])}”")
 
     if name == "report_time":
         try:
@@ -1472,13 +1558,20 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
             return "❌ minutes harus angka (menit)."
         if minutes <= 0:
             return "❌ minutes harus > 0."
-        return act_report_time(cfg, row, task, minutes,
-                               (args.get("note") or "").strip())
+        note = (args.get("note") or "").strip()
+        return propose({"minutes": minutes, "note": note},
+                       f"⏱ Report time <b>{minutes} menit</b> di {lbl}"
+                       + (f" (“{html.escape(note[:60])}”)" if note else ""))
 
     if name == "set_story_points":
         raw = args.get("points")
         points = None if raw in (0, "0", "-", None, "") else int(raw)
-        return act_set_story_points(cfg, row, task, points)
+        if points is not None and points not in STORY_POINT_CHOICES:
+            pil = "/".join(str(p) for p in STORY_POINT_CHOICES)
+            return f"❌ Story points harus salah satu dari: {pil}."
+        return propose({"points": points},
+                       f"🎯 Story points {lbl} → "
+                       f"<b>{'hapus' if points is None else points}</b>")
 
     if name == "set_dates":
         sd = parse_date_token(str(args.get("start_date", "")))
@@ -1488,7 +1581,9 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
             return "❌ Format tanggal harus YYYY-MM-DD."
         if ed < sd:
             return "❌ end_date ga boleh sebelum start_date."
-        return act_set_dates(cfg, row, task, sd, ed)
+        return propose({"sd": sd, "ed": ed},
+                       f"📅 Jadwal {lbl} → "
+                       f"<b>{human_date(sd)} → {human_date(ed)}</b>")
 
     if name == "set_custom_field":
         fields = cached_custom_fields(cfg, cache)
@@ -1500,11 +1595,14 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
             return (f"❌ Custom field '{args.get('field_name')}' ga ada / di luar "
                     f"whitelist. Pilihan: {names or '(ga ada)'}")
         raw = args.get("value")
+        fdisp = html.escape(field.get("name") or str(field.get("id")))
+        fid = str(field.get("id"))
         if field.get("type") == 23:  # checkbox -> boolean asli
             on = str(raw).strip().lower() in ("1", "true", "ya", "yes", "centang",
                                               "on", "✓")
-            return act_set_custom_field(cfg, row, task, field, on,
-                                        "✓ dicentang" if on else "✗ tanpa centang")
+            vlabel = "✓ dicentang" if on else "✗ tanpa centang"
+            return propose({"field_id": fid, "value": on, "value_label": vlabel},
+                           f"🧾 {fdisp} di {lbl} → <b>{vlabel}</b>")
         items = (field.get("params") or {}).get("listItems") or []
         if items:  # dropdown -> value = id item
             it = next((x for x in items
@@ -1513,19 +1611,72 @@ def _ai_run_tool(cfg, row, cache, name, args) -> str:
             if not it:
                 opts = ", ".join(str(x.get("value")) for x in items)
                 return f"❌ Nilai '{raw}' ga ada buat {field.get('name')}. Pilihan: {opts}"
-            return act_set_custom_field(cfg, row, task, field,
-                                        int(it.get("id")), str(it.get("value")))
-        return act_set_custom_field(cfg, row, task, field, raw, str(raw))
+            return propose({"field_id": fid, "value": int(it.get("id")),
+                            "value_label": str(it.get("value"))},
+                           f"🧾 {fdisp} di {lbl} → "
+                           f"<b>{html.escape(str(it.get('value')))}</b>")
+        return propose({"field_id": fid, "value": raw, "value_label": str(raw)},
+                       f"🧾 {fdisp} di {lbl} → <b>{html.escape(str(raw))}</b>")
 
     return f"❌ Tool '{name}' ga dikenal."
 
 
-def ai_interpret(cfg, row, text: str, cache=None):
-    """Hook AI: teks bebas user -> LLM (via 9router/OpenAI-compatible) -> tool-call
-    -> fungsi act_* YANG SAMA dengan tombol -> return teks balasan HTML.
-    Return None = AI tidak paham -> pemanggil fallback perilaku default.
-    KONTRAK: tidak boleh raise; tidak boleh menyentuh task selain milik `row`
-    (dijamin lewat user_owns_task di _ai_run_tool)."""
+def _ai_exec_proposal(cfg, row, cache, p) -> str:
+    """Eksekusi satu proposal yang SUDAH dikonfirmasi user -> panggil act_*."""
+    t = p.get("task") or {}
+    a = p.get("args") or {}
+    tool = p.get("tool")
+    if not t.get("id"):
+        return "❌ Data task proposal rusak."
+    if tool == "update_status":
+        return act_update_status(cfg, row, t, a["status_id"], a["status_name"])
+    if tool == "add_comment":
+        return act_comment(cfg, row, t, a["message"])
+    if tool == "report_time":
+        return act_report_time(cfg, row, t, a["minutes"], a.get("note", ""))
+    if tool == "set_story_points":
+        return act_set_story_points(cfg, row, t, a.get("points"))
+    if tool == "set_dates":
+        return act_set_dates(cfg, row, t, a["sd"], a["ed"])
+    if tool == "set_custom_field":
+        field = cached_custom_fields(cfg, cache).get(a.get("field_id"))
+        if not field:
+            return "❌ Field-nya udah ga ada / di luar whitelist."
+        return act_set_custom_field(cfg, row, t, field, a.get("value"),
+                                    a.get("value_label", ""))
+    return "❌ Aksi ga dikenal."
+
+
+def _ai_send_confirmation(cfg, conn, row, proposals) -> str:
+    """Simpan proposal + kirim pesan konfirmasi bertombol. Return "" (artinya
+    pemanggil TIDAK perlu kirim apa-apa lagi — sudah dikirim di sini)."""
+    nonce = uuid.uuid4().hex[:8]
+    chat_id = str(row["telegram_chat_id"])
+    set_ai_pending(conn, chat_id, nonce, json.dumps(proposals))
+    lines = ["⚠️ <b>Konfirmasi dulu</b> — aku BELUM ngubah apa pun di GoodDay.",
+             "Aku mau lakuin ini:"]
+    for i, p in enumerate(proposals, 1):
+        lines.append(f"{i}. {p.get('desc')}")
+    lines.append("")
+    lines.append("🟢 Semua task di atas milik <b>Opsifin</b> &amp; sudah "
+                 "diverifikasi. Cuma task ini yang bakal disentuh.")
+    kb = {"inline_keyboard": [[
+        {"text": "✅ Ya, lakukan", "callback_data": f"aiok:{nonce}"},
+        {"text": "✖️ Batal", "callback_data": f"aino:{nonce}"},
+    ]]}
+    tg_send(cfg["bot_token"], chat_id, "\n".join(lines), reply_markup=kb)
+    return ""
+
+
+def ai_interpret(cfg, row, text: str, cache=None, conn=None):
+    """Hook AI: teks bebas user -> LLM (OpenAI-compatible) -> tool-call.
+    Aksi tulis TIDAK dieksekusi di sini — cuma DISIAPKAN sbg proposal, lalu
+    user WAJIB konfirmasi lewat tombol (_ai_send_confirmation). get_task read-only.
+    Return:
+      None -> AI ga paham (pemanggil kirim pesan fallback default)
+      ""   -> AI sudah kirim pesannya sendiri (mis. minta konfirmasi aksi)
+      str  -> teks balasan buat dikirim pemanggil
+    KONTRAK: tidak boleh raise; hanya menyentuh task Opsifin & yang diinstruksikan."""
     if cache is None:
         cache = {}
     if not row or not row["gd_user_id"]:
@@ -1541,15 +1692,13 @@ def ai_interpret(cfg, row, text: str, cache=None):
             {"role": "user", "content": text},
         ]
         tools = _ai_tools_spec()
-        act_results = []
+        proposals, results, final = [], [], ""
         for _ in range(5):  # batas ronde tool-call
             msg = _ai_chat(cfg, messages, tools)
             calls = msg.get("tool_calls") or []
             if not calls:
                 final = (msg.get("content") or "").strip()
-                if act_results:
-                    return "\n".join(act_results) + (("\n\n" + final) if final else "")
-                return final or None
+                break
             messages.append({"role": "assistant",
                              "content": msg.get("content"), "tool_calls": calls})
             for c in calls:
@@ -1558,11 +1707,18 @@ def ai_interpret(cfg, row, text: str, cache=None):
                     a = json.loads(fn.get("arguments") or "{}")
                 except (ValueError, TypeError):
                     a = {}
-                result = _ai_run_tool(cfg, row, cache, fn.get("name"), a)
-                act_results.append(result)
+                res = _ai_run_tool(cfg, row, cache, fn.get("name"), a, proposals)
+                results.append(res)
                 messages.append({"role": "tool", "tool_call_id": c.get("id"),
-                                 "content": result})
-        return "\n".join(act_results) if act_results else None
+                                 "content": res})
+        # ada aksi disiapkan -> minta konfirmasi user (JANGAN tulis sekarang)
+        if proposals and conn is not None:
+            return _ai_send_confirmation(cfg, conn, row, proposals)
+        if final:
+            return final
+        if results:
+            return "\n".join(results)
+        return None
     except Exception as e:  # kontrak: AI gagal ga boleh mecahin bot
         print(f"  ! ai_interpret LLM error: {e}", file=sys.stderr)
         return f"⚠️ AI lagi ga bisa dipanggil: {html.escape(str(e)[:150])}"
@@ -2038,8 +2194,9 @@ def handle_message(cfg, cache, msg: dict) -> None:
                     info += ("\n⚠️ AI ga akan jalan sampai AI_API_KEY diisi di .env "
                              "(fallback perilaku default tetap aman).")
                 if on and cfg["ai_api_key"]:
-                    info += ("\nℹ️ Panggilan LLM masih scaffold — semua teks bebas "
-                             "tetap fallback ke perilaku default.")
+                    info += ("\nℹ️ AI aktif: bisa baca/siapin aksi task lewat "
+                             "chat. Tiap aksi WAJIB konfirmasi tombol ✅ dulu, dan "
+                             "cuma task <b>Opsifin</b> yang boleh diubah.")
                 tg_send(cfg["bot_token"], chat_id, info)
     elif not cmd.startswith("/") and get_pending(conn, chat_id):
         # ada pending action -> teks bebas ini input-nya (ID GD, comment, dll.)
@@ -2050,11 +2207,14 @@ def handle_message(cfg, cache, msg: dict) -> None:
         reply = None
         if not cmd.startswith("/") and ai_enabled(cfg, conn):
             try:
-                reply = ai_interpret(cfg, get_recipient(conn, chat_id), text, cache)
+                reply = ai_interpret(cfg, get_recipient(conn, chat_id), text,
+                                     cache, conn)
             except Exception as e:  # kontrak: AI gagal ga boleh mecahin bot
                 print(f"  ! ai_interpret error: {e}", file=sys.stderr)
                 reply = None
-        if reply:
+        if reply == "":
+            pass  # AI sudah kirim pesannya sendiri (mis. minta konfirmasi aksi)
+        elif reply:
             tg_send(cfg["bot_token"], chat_id, reply)
         else:
             tg_send(cfg["bot_token"], chat_id,
@@ -2152,6 +2312,44 @@ def handle_callback(cfg, cache, cq: dict) -> None:
                     "❌ Pendaftaran kamu ditolak admin. Kalau merasa ini keliru, "
                     "hubungi admin, atau coba /daftar lagi dengan ID yang benar.")
             print(f"  rej  admin {from_id} tolak {target}")
+        return
+
+    # konfirmasi aksi AI (tombol ✅/✖️) — eksekusi tulis ke GoodDay HANYA di sini,
+    # setelah user setuju. Guard: require_self + nonce (cegah klik basi).
+    if data.startswith(("aiok:", "aino:")):
+        row, err = require_self(cfg, from_id)
+        if not row:
+            answer(err, alert=True)
+            return
+        nonce = data.split(":", 1)[1]
+        conn = db_connect(cfg["db_path"])
+        pend = get_ai_pending(conn, chat_id)
+        if not pend or pend[0] != nonce:
+            clear_ai_pending(conn, chat_id)
+            conn.close()
+            answer("Konfirmasi ini udah kadaluarsa / kepakai.", alert=True)
+            edit("⌛ Konfirmasi udah kadaluarsa atau dibatalkan. Minta lagi ya.")
+            return
+        payload = pend[1]
+        clear_ai_pending(conn, chat_id)
+        conn.close()
+        if data.startswith("aino:"):
+            answer("Dibatalin")
+            edit("✖️ Oke, dibatalin. Ga ada yang diubah di GoodDay.")
+            return
+        try:
+            proposals = json.loads(payload)
+        except (ValueError, TypeError):
+            proposals = []
+        answer("⏳ Ngerjain…")
+        outs = []
+        for p in proposals:
+            try:
+                outs.append(_ai_exec_proposal(cfg, row, cache, p))
+            except Exception as e:
+                outs.append(f"❌ Gagal: {html.escape(str(e)[:120])}")
+        edit("\n".join(outs) if outs else "Ga ada aksi buat dijalanin.")
+        print(f"  aiok {chat_id}: {len(proposals)} aksi dieksekusi")
         return
 
     # sisanya cuma buat chat privat (menu pendaftaran)
