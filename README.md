@@ -86,7 +86,7 @@ DIGEST_GD_USERS=id1,id2,id3
 READY_STREAM_FIELD=gLu7pt
 READY_STREAM_VALUE=8
 READY_DELIVERY_FIELD=ZJVsCT
-READY_STORYPOINT_SOURCE=estimate
+READY_NEED_SP_TAG=PU7NBR   # tag 'need-story-point' (cek SP via GET /tag/{id}/tasks)
 
 # custom field yang boleh diubah dari Telegram (whitelist)
 EDIT_CUSTOM_FIELDS=gLu7pt,ZJVsCT
@@ -177,10 +177,11 @@ kapan pun dengan `/batal`. Semua aksi diverifikasi kepemilikan task-nya.
 
 ### Label kesiapan 🟢/🚧
 
-Task di section 🔥 HARI INI dan ⚠️ TELAT diberi label:
+Task di section 🔥 HARI INI, ⚠️ TELAT, dan 📌 AKAN JALAN diberi label:
 
-- **🟢 SIAP DIKERJAKAN** — memenuhi SEMUA: story point (estimate) terisi,
-  start & end date terisi, Product Stream = Opsifin, Delivery Task dicentang.
+- **🟢 SIAP DIKERJAKAN** — memenuhi SEMUA: sudah di-story-point (task TIDAK
+  lagi bertag `need-story-point`), start & end date terisi, Product Stream =
+  Opsifin, Delivery Task dicentang.
 - **🚧 BELUM SIAP** — ada yang kurang; alasannya ditulis
   (mis. `🚧 BELUM SIAP — story point kosong, Delivery Task belum dicentang`).
 
@@ -274,12 +275,16 @@ Bawa juga `reminders.db` dari mesin lama kalau mau mempertahankan pendaftaran
 
 ## Isi pesan reminder
 
-Semua **task aktif** (yang closed tidak diambil), dikelompokkan:
+Reminder cuma menampilkan task yang **relevan sekarang** — task yang jalan hari
+ini + yang bakal jalan seminggu ke depan. Task di luar jendela itu sengaja
+disembunyikan (bisa dicari via `/cari`). Dikelompokkan:
 
 1. 🔥 **HARUS JALAN HARI INI** — `startDate`/`deadline` == hari ini (WIB) +
    label 🟢/🚧, ⏰ *deadline HARI INI* / 🚀 *mulai HARI INI*.
-2. ⚠️ **LEWAT DEADLINE** — masih open tapi telat, + berapa hari telatnya + 🟢/🚧.
-3. 📌 **TASK AKTIF LAINNYA** — urut deadline terdekat (maks. 20).
+2. ⚠️ **LEWAT DEADLINE** — telat, maksimal 7 hari ke belakang
+   (`OVERDUE_WINDOW_DAYS`), lengkap dengan berapa hari telatnya dan 🟢/🚧.
+3. 📌 **AKAN JALAN 7 HARI KE DEPAN** — `startDate` ATAU `deadline` jatuh dalam
+   7 hari ke depan (`UPCOMING_WINDOW_DAYS`), urut yang paling dekat (maks. 20).
 
 Tiap task berupa **link yang bisa diklik** ke GoodDay (pakai id task, format
 `goodday.work/t/<id>`), plus nomor `#shortId`, project, status, prioritas

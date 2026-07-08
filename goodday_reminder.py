@@ -56,7 +56,7 @@ import html
 import time
 import sqlite3
 import argparse
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 try:
@@ -84,7 +84,12 @@ TIMEZONE = "Asia/Jakarta"  # WIB
 HTTP_TIMEOUT = 30
 POLL_TIMEOUT = 50          # long-polling getUpdates (detik)
 TG_MSG_LIMIT = 3900        # limit Telegram 4096; sisain ruang aman
-MAX_OTHERS = 20            # maksimal task "lainnya" yang ditampilkan
+MAX_OTHERS = 20            # maksimal task "akan datang" yang ditampilkan
+# jendela relevansi reminder (keputusan user 2026-07-08): cuma task yang jalan
+# hari ini, telat maksimal N hari ke belakang, atau bakal jalan N hari ke depan.
+# Sisanya sengaja disembunyikan — bisa dicari via /cari.
+OVERDUE_WINDOW_DAYS = 7    # telat maksimal berapa hari ke belakang yang ditampilkan
+UPCOMING_WINDOW_DAYS = 7   # bakal jalan berapa hari ke depan yang ditampilkan
 CACHE_TTL = 600            # cache user/project GoodDay di mode bot (detik)
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -122,11 +127,11 @@ def get_config():
         "ready_stream_field": os.environ.get("READY_STREAM_FIELD", "gLu7pt").strip(),
         "ready_stream_value": os.environ.get("READY_STREAM_VALUE", "8").strip(),
         "ready_delivery_field": os.environ.get("READY_DELIVERY_FIELD", "ZJVsCT").strip(),
-        # sumber story point buat ready-check. ⚠️ terverifikasi 2026-07-07:
-        # API GoodDay TIDAK pernah mengembalikan "storyPoints" (bahkan setelah
-        # di-set via PUT /update) -> default & produksi pakai "estimate"
-        "ready_storypoint_source": os.environ.get("READY_STORYPOINT_SOURCE",
-                                                  "estimate").strip(),
+        # ready-check story point (keputusan user 2026-07-08): API GoodDay TIDAK
+        # mengembalikan storyPoints MAUPUN tag di objek task, jadi cek "belum
+        # di-story-point" via tag khusus. GET /tag/{id}/tasks -> daftar task yang
+        # MASIH bertag 'need-story-point'; task yang ada di situ = SP belum diisi.
+        "ready_need_sp_tag": os.environ.get("READY_NEED_SP_TAG", "PU7NBR").strip(),
         # custom field yang boleh diubah dari Telegram (whitelist id, pisah koma)
         "edit_custom_fields": [x.strip() for x in
                                os.environ.get("EDIT_CUSTOM_FIELDS", "gLu7pt,ZJVsCT")
@@ -456,6 +461,12 @@ def gd_assigned_tasks(api_token: str, user_id: str):
     return gd_get(f"user/{user_id}/assigned-tasks", api_token)
 
 
+def gd_tag_tasks(api_token: str, tag_id: str):
+    """GET /tag/{id}/tasks -> daftar task yang punya tag itu (org-wide).
+    Dipakai buat cek tag 'need-story-point' (task detail ga mengekspos tag)."""
+    return gd_get(f"tag/{tag_id}/tasks", api_token)
+
+
 def gd_project_map(api_token: str) -> dict:
     """Map projectId -> nama project. Gagal fetch = map kosong (nama ga tampil)."""
     try:
@@ -500,25 +511,43 @@ def date_only(value):
     return str(value)[:10] if value else None
 
 
-def split_tasks(tasks: list, today: str):
-    """Bagi task jadi 3 kelompok: hari ini, lewat deadline, dan lainnya."""
-    todays, overdue, others = [], [], []
+def split_tasks(tasks: list, today: str,
+                back_days: int = OVERDUE_WINDOW_DAYS,
+                ahead_days: int = UPCOMING_WINDOW_DAYS):
+    """Filter + bagi task jadi 3 kelompok yang relevan buat reminder
+    (keputusan user 2026-07-08):
+      - hari ini   : mulai / deadline == hari ini
+      - telat      : deadline lewat, maksimal `back_days` hari ke belakang
+      - akan datang: mulai ATAU deadline dalam `ahead_days` hari ke depan
+    Task di luar itu (jauh di depan, telat > back_days, atau tanpa tanggal
+    relevan) SENGAJA dibuang — user bisa nyari sendiri via /cari."""
+    today_d = date.fromisoformat(today)
+    lo = (today_d - timedelta(days=back_days)).isoformat()   # batas telat terjauh
+    hi = (today_d + timedelta(days=ahead_days)).isoformat()  # batas depan terjauh
+    todays, overdue, upcoming = [], [], []
     for t in tasks:
-        starts = date_only(t.get("startDate")) == today
+        sd = date_only(t.get("startDate"))
         dl = date_only(t.get("deadline"))
+        starts = sd == today
         due = dl == today
         t["_starts"], t["_due"] = starts, due
         if starts or due:
             todays.append(t)
-        elif dl and dl < today:
+        elif dl and lo <= dl < today:
             overdue.append(t)
-        else:
-            others.append(t)
+        elif (sd and today < sd <= hi) or (dl and today < dl <= hi):
+            upcoming.append(t)
+        # else: di luar jendela -> dibuang
+
+    def soonest(t):  # tanggal relevan paling dekat di masa depan
+        cands = [d for d in (date_only(t.get("startDate")),
+                             date_only(t.get("deadline"))) if d and d > today]
+        return min(cands) if cands else "9999-12-31"
+
     todays.sort(key=lambda x: (not x["_due"], -(x.get("priority") or 0)))
     overdue.sort(key=lambda x: (date_only(x.get("deadline")) or "", -(x.get("priority") or 0)))
-    others.sort(key=lambda x: (date_only(x.get("deadline")) or "9999-12-31",
-                               -(x.get("priority") or 0)))
-    return todays, overdue, others
+    upcoming.sort(key=lambda x: (soonest(x), -(x.get("priority") or 0)))
+    return todays, overdue, upcoming
 
 
 def priority_label(p):
@@ -541,12 +570,30 @@ def _num_eq(a, b) -> bool:
         return str(a) == str(b)
 
 
-def task_ready(cfg, detail: dict):
+def need_sp_ids(cfg, cache) -> set:
+    """Set task-id yang MASIH bertag 'need-story-point' (READY_NEED_SP_TAG).
+    Sekali fetch per CACHE_TTL. Gagal fetch -> set kosong: kriteria SP dianggap
+    lolos, biar ga bikin SEMUA task ke-cap 'belum siap' cuma gara-gara API error."""
+    tag = cfg.get("ready_need_sp_tag")
+    if not tag:
+        return set()
+    if "need_sp" not in cache or time.time() - cache.get("need_sp_ts", 0) > CACHE_TTL:
+        try:
+            tasks = gd_tag_tasks(cfg["api_token"], tag)
+            cache["need_sp"] = {str(t.get("id")) for t in tasks if t.get("id")}
+        except Exception as e:
+            print(f"  ! fetch tag {tag} (need-story-point) gagal: {e}", file=sys.stderr)
+            cache["need_sp"] = set()
+        cache["need_sp_ts"] = time.time()
+    return cache["need_sp"]
+
+
+def task_ready(cfg, detail: dict, need_sp: set):
     """Cek 4 syarat 🟢 SIAP DIKERJAKAN (PRD §6.2) dari detail GET /task/{id}.
+    `need_sp`: set task-id yang masih perlu story point (dari need_sp_ids()).
     Return (bool, [alasan yang kurang])."""
     why = []
-    sp = detail.get(cfg["ready_storypoint_source"])
-    if sp in (None, "", 0):
+    if str(detail.get("id")) in need_sp:
         why.append("story point kosong")
     if not detail.get("startDate"):
         why.append("start date kosong")
@@ -562,13 +609,23 @@ def task_ready(cfg, detail: dict):
 
 
 def mark_ready(cfg, tasks: list, today: str, cache: dict) -> None:
-    """Tempelkan t['_ready'] & t['_why'] ke task hari-ini + telat (yang lain
-    dibiarkan — label cuma buat yang urgent). Detail di-cache biar /tasks
-    berulang ga nembak API terus. Gagal fetch = tanpa label (bukan error)."""
+    """Tempelkan t['_ready'] & t['_why'] ke task yang bakal ditampilkan (hari
+    ini + telat ≤ OVERDUE_WINDOW_DAYS + akan datang ≤ UPCOMING_WINDOW_DAYS) —
+    sama persis dgn jendela split_tasks, jadi ga buang kuota API buat task yang
+    toh disembunyikan. Detail di-cache biar /tasks berulang ga nembak API terus.
+    Gagal fetch = tanpa label (bukan error)."""
+    need_sp = need_sp_ids(cfg, cache)
+    today_d = date.fromisoformat(today)
+    lo = (today_d - timedelta(days=OVERDUE_WINDOW_DAYS)).isoformat()
+    hi = (today_d + timedelta(days=UPCOMING_WINDOW_DAYS)).isoformat()
     store = cache.setdefault("ready", {})
     for t in tasks:
         sd, dl = date_only(t.get("startDate")), date_only(t.get("deadline"))
-        if not (sd == today or (dl and dl <= today)):
+        relevant = (sd == today or dl == today
+                    or (dl and lo <= dl < today)
+                    or (sd and today < sd <= hi)
+                    or (dl and today < dl <= hi))
+        if not relevant:
             continue
         tid = t.get("id")
         if not tid:
@@ -578,7 +635,7 @@ def mark_ready(cfg, tasks: list, today: str, cache: dict) -> None:
             t["_ready"], t["_why"] = hit[1], hit[2]
             continue
         try:
-            ready, why = task_ready(cfg, gd_task_detail(cfg["api_token"], tid))
+            ready, why = task_ready(cfg, gd_task_detail(cfg["api_token"], tid), need_sp)
         except Exception as e:
             print(f"  ! ready-check {tid} gagal: {e}", file=sys.stderr)
             continue
@@ -677,7 +734,13 @@ def build_message(tasks: list, today: str, greeting_name: str = "",
         return (f"✅ <b>GoodDay — {human_today()}</b>\n\n"
                 f"Hai{hi}, ga ada task aktif yang di-assign ke kamu. Santai. 🎉")
 
-    todays, overdue, others = split_tasks(tasks, today)
+    todays, overdue, upcoming = split_tasks(tasks, today)
+    relevan = len(todays) + len(overdue) + len(upcoming)
+    if relevan == 0:
+        return (f"✅ <b>GoodDay — {human_today()}</b>\n\n"
+                f"Hai{hi}, ga ada task yang jalan hari ini, telat, atau bakal "
+                f"jalan {UPCOMING_WINDOW_DAYS} hari ke depan. Santai. 🎉\n"
+                f"<i>Butuh task lain? Pakai /cari.</i>")
     lines = [f"📋 <b>GoodDay — {human_today()}</b>",
              f"Hai{hi}, ini daftar task kamu:"]
     idx = 1
@@ -703,12 +766,14 @@ def build_message(tasks: list, today: str, greeting_name: str = "",
         lines += ["", "😌 Ga ada task yang mulai / deadline hari ini."]
     if overdue:
         section(f"⚠️ <b>LEWAT DEADLINE ({len(overdue)})</b>", overdue)
-    if others:
-        section(f"📌 <b>TASK AKTIF LAINNYA ({len(others)})</b>", others, MAX_OTHERS)
+    if upcoming:
+        section(f"📌 <b>AKAN JALAN {UPCOMING_WINDOW_DAYS} HARI KE DEPAN "
+                f"({len(upcoming)})</b>", upcoming, MAX_OTHERS)
 
-    lines.append(f"Total <b>{len(tasks)}</b> task aktif — "
+    lines.append(f"Total <b>{relevan}</b> task relevan — "
                  f"🔥 {len(todays)} hari ini · ⚠️ {len(overdue)} telat · "
-                 f"📌 {len(others)} lainnya")
+                 f"📌 {len(upcoming)} minggu ini\n"
+                 f"<i>Task lain di luar jendela ini bisa dicari via /cari.</i>")
     return "\n".join(lines)
 
 
@@ -1761,7 +1826,8 @@ def send_task_card(cfg, cache, chat_id: str, row, ref: str) -> bool:
     task["_starts"] = date_only(task.get("startDate")) == today
     task["_due"] = date_only(task.get("deadline")) == today
     try:
-        ready, why = task_ready(cfg, gd_task_detail(cfg["api_token"], task["id"]))
+        ready, why = task_ready(cfg, gd_task_detail(cfg["api_token"], task["id"]),
+                                need_sp_ids(cfg, cache))
         task["_ready"], task["_why"] = ready, why
     except Exception as e:
         print(f"  ! ready-check {task.get('id')} gagal: {e}", file=sys.stderr)
@@ -1894,8 +1960,8 @@ def tasks_kb(tasks, today: str) -> dict:
     memang khusus chat privat). Semua task yang TAMPIL di pesan dapat tombol,
     urut sama dengan nomor di daftar; Telegram max 100 tombol — sisain satu
     baris buat "Task lain…"."""
-    todays, overdue, others = split_tasks(list(tasks), today)
-    shown = todays + overdue + others[:MAX_OTHERS]
+    todays, overdue, upcoming = split_tasks(list(tasks), today)
+    shown = todays + overdue + upcoming[:MAX_OTHERS]
     btns = [{"text": f"✏️ #{t.get('shortId')}",
              "callback_data": f"act:{t.get('id')}"}
             for t in shown[:96] if t.get("id")]

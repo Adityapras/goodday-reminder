@@ -40,6 +40,8 @@ import datetime as _dt
 _today = _dt.date.fromisoformat(today)
 kemarin = (_today - _dt.timedelta(days=3)).isoformat()
 besok = (_today + _dt.timedelta(days=2)).isoformat()
+jauh = (_today + _dt.timedelta(days=30)).isoformat()   # di luar jendela -> disembunyikan
+lama = (_today - _dt.timedelta(days=30)).isoformat()   # telat >7 hari -> disembunyikan
 
 FAKE_TASKS = {
     "GD-USER-ADITYA": [
@@ -52,9 +54,15 @@ FAKE_TASKS = {
         {"id": "Tk300", "name": "Task telat (deadline lewat 3 hari)", "shortId": "300",
          "projectId": "P1", "priority": 5,
          "status": {"name": "In Progress"}, "deadline": kemarin},
-        {"id": "Tk320", "name": "Task minggu depan (masuk 'lainnya')", "shortId": "320",
-         "projectId": "P2", "priority": 5,
+        {"id": "Tk320", "name": "Task minggu depan (akan jalan 7 hari ke depan)",
+         "shortId": "320", "projectId": "P2", "priority": 5,
          "status": {"name": "New"}, "deadline": besok},
+        {"id": "Tk900", "name": "Task jauh di depan (disembunyikan)", "shortId": "900",
+         "projectId": "P1", "priority": 5,
+         "status": {"name": "New"}, "startDate": jauh, "deadline": jauh},
+        {"id": "Tk901", "name": "Task telat lama >7 hari (disembunyikan)",
+         "shortId": "901", "projectId": "P1", "priority": 5,
+         "status": {"name": "In Progress"}, "deadline": lama},
     ],
     "GD-USER-BUDI": [
         {"id": "Tk501", "name": "Deploy staging QR ordering", "shortId": "501",
@@ -67,18 +75,22 @@ FAKE_TASKS = {
 FAKE_PROJECTS = {"P1": "Opsifin Core", "P2": "Opsifin KDS"}
 
 # detail per task -> buat label 🟢 SIAP / 🚧 BELUM SIAP (4 syarat PRD §6.2):
-# estimate terisi, start+end date terisi, Product Stream=Opsifin (gLu7pt=8),
-# Delivery Task dicentang (ZJVsCT=true)
+# sudah di-story-point (task TIDAK bertag 'need-story-point'), start+end date
+# terisi, Product Stream=Opsifin (gLu7pt=8), Delivery Task dicentang (ZJVsCT=true)
 FAKE_DETAILS = {
-    "Tk412": {"estimate": 3, "startDate": today, "endDate": today,
+    "Tk412": {"id": "Tk412", "startDate": today, "endDate": today,
               "customFieldsData": {"gLu7pt": 8, "ZJVsCT": True}},   # -> 🟢
-    "Tk418": {"estimate": None, "startDate": today, "endDate": None,
+    "Tk418": {"id": "Tk418", "startDate": today, "endDate": None,
               "customFieldsData": {"gLu7pt": 2, "ZJVsCT": False}},  # -> 🚧
-    "Tk300": {"estimate": 2, "startDate": kemarin, "endDate": kemarin,
+    "Tk300": {"id": "Tk300", "startDate": kemarin, "endDate": kemarin,
               "customFieldsData": {"gLu7pt": 8, "ZJVsCT": False}},  # -> 🚧
-    "Tk501": {"estimate": 1, "startDate": today, "endDate": today,
+    "Tk501": {"id": "Tk501", "startDate": today, "endDate": today,
               "customFieldsData": {"gLu7pt": 8, "ZJVsCT": True}},   # -> 🟢
 }
+
+# task yang MASIH bertag 'need-story-point' (dari GET /tag/{id}/tasks):
+# Tk418 belum di-story-point -> ikut jadi alasan 🚧
+FAKE_NEED_SP = [{"id": "Tk418"}]
 
 FAKE_GD_USERS = [
     {"id": "GD-USER-ADITYA", "firstName": "Aditya", "lastName": "P"},
@@ -90,6 +102,7 @@ FAKE_GD_USERS = [
 gd.gd_assigned_tasks = lambda api_token, user_id: FAKE_TASKS.get(user_id, [])
 gd.gd_project_map = lambda api_token: FAKE_PROJECTS
 gd.gd_task_detail = lambda api_token, task_id: FAKE_DETAILS[task_id]
+gd.gd_tag_tasks = lambda api_token, tag_id: FAKE_NEED_SP
 gd.gd_list_users = lambda api_token: FAKE_GD_USERS
 gd.tg_api = lambda bot_token, method, payload=None, timeout=None: {}
 
@@ -116,7 +129,7 @@ cfg = {
     "digest_bot_token": "",
     "admin_chat_ids": ["99999999"],  # admin palsu buat demo approval
     "ready_stream_field": "gLu7pt", "ready_stream_value": "8",
-    "ready_delivery_field": "ZJVsCT", "ready_storypoint_source": "estimate",
+    "ready_delivery_field": "ZJVsCT", "ready_need_sp_tag": "PU7NBR",
     "edit_custom_fields": ["gLu7pt", "ZJVsCT"],
     "ai_provider": "", "ai_api_key": "", "ai_model": "", "ai_base_url": "",
 }
