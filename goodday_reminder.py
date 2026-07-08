@@ -1402,6 +1402,11 @@ def _ai_tools_spec():
              "tanggal, project, dll). Pakai ini kapan pun user nyebut task lewat "
              "#shortId / id / link, termasuk task yang ga ada di daftar user.",
              {"task_ref": ref}, ["task_ref"]),
+        tool("list_recipients", "Daftar penerima/orang yang sudah TERDAFTAR di "
+             "bot ini (dari database bot, bukan GoodDay). Pakai kalau user nanya "
+             "'siapa aja yang udah daftar / terdaftar / pakai bot ini'. "
+             "KHUSUS ADMIN — otomatis nolak kalau user bukan admin.",
+             {}, []),
         tool("update_status", "Ganti status sebuah task.",
              {"task_ref": ref, "status_name": {"type": "string",
               "description": "Nama status, persis salah satu dari daftar status valid"}},
@@ -1429,7 +1434,7 @@ def _ai_tools_spec():
     ]
 
 
-def _ai_system_prompt(today, tasks, statuses, cfields) -> str:
+def _ai_system_prompt(today, tasks, statuses, cfields, is_admin=False) -> str:
     lines = []
     for t in tasks[:60]:
         st = (t.get("status") or {}).get("name") or "?"
@@ -1482,8 +1487,14 @@ def _ai_system_prompt(today, tasks, statuses, cfields) -> str:
         "Opsifin (⛔), sampaikan apa adanya — jangan maksa.\n"
         "- Kalau user cuma nanya/ngobrol, jawab langsung.\n"
         "- Cuma tanya balik kalau BENER-BENER ambigu (mis. nilai status ga jelas). "
-        "Kalau id/link udah ada, kerjain — jangan muter-muter.\n\n"
-        f"Hari ini: {today} (WIB).\n\n"
+        "Kalau id/link udah ada, kerjain — jangan muter-muter.\n"
+        + ("- User ini ADMIN. Kalau dia nanya siapa saja yang sudah "
+           "TERDAFTAR/pakai bot ini (penerima), panggil tool list_recipients.\n"
+           if is_admin else
+           "- Kamu TIDAK bisa lihat daftar penerima/siapa yang terdaftar di bot "
+           "(itu khusus admin). Kalau ditanya, bilang terus terang kamu ga punya "
+           "akses ke situ — JANGAN nebak-nebak nama.\n")
+        + f"\nHari ini: {today} (WIB).\n\n"
         f"TASK AKTIF (assigned) USER:\n{task_block}\n\n"
         f"STATUS valid: {status_names}\n"
         "STORY POINTS valid: 1, 3, 5, 8, 13 (0 = hapus)\n"
@@ -1581,6 +1592,17 @@ def _ai_run_tool(cfg, row, cache, name, args, proposals) -> str:
         if err:
             return f"❌ {err}"
         return _ai_task_summary(cfg, cache, task)
+
+    if name == "list_recipients":
+        # SENSITIF: cuma admin. Guard di sini (bukan cuma di prompt) biar aman
+        # walau LLM salah panggil buat non-admin.
+        if str(row["telegram_chat_id"]) not in cfg["admin_chat_ids"]:
+            return "🔒 Daftar penerima cuma bisa dilihat admin."
+        conn = db_connect(cfg["db_path"])
+        try:
+            return recipients_text(conn)
+        finally:
+            conn.close()
 
     task, err = _ai_resolve_task(cfg, row, args.get("task_ref"))
     if err:
@@ -1751,9 +1773,11 @@ def ai_interpret(cfg, row, text: str, cache=None, conn=None):
         tasks = gd_assigned_tasks(cfg["api_token"], row["gd_user_id"])
         statuses = cached_statuses(cfg, cache)
         cfields = cached_custom_fields(cfg, cache)
+        is_admin = str(row["telegram_chat_id"]) in cfg["admin_chat_ids"]
         messages = [
             {"role": "system",
-             "content": _ai_system_prompt(today, tasks, statuses, cfields)},
+             "content": _ai_system_prompt(today, tasks, statuses, cfields,
+                                          is_admin=is_admin)},
             {"role": "user", "content": text},
         ]
         tools = _ai_tools_spec()
@@ -2061,6 +2085,34 @@ def status_text(conn, chat_id: str) -> str:
             f"(<code>{row['gd_user_id']}</code>) — reminder {aktif}.")
 
 
+def _recipient_status(r) -> str:
+    """Label status satu penerima (dipakai /terdaftar + tool AI)."""
+    if not r["gd_user_id"]:
+        return "⚠️ belum link GoodDay"
+    if not r["approved"]:
+        return "⏳ nunggu approval"
+    return "🟢 aktif" if r["enabled"] else "🔕 nonaktif"
+
+
+def recipients_text(conn) -> str:
+    """Daftar penerima terdaftar buat admin (dari reminders.db). Dipakai command
+    /terdaftar DAN tool AI list_recipients — SATU sumber format biar konsisten.
+    SENSITIF (nama + GoodDay id) → pemanggil WAJIB memastikan cuma admin."""
+    rows = conn.execute("SELECT * FROM recipients ORDER BY id").fetchall()
+    if not rows:
+        return "👥 Belum ada penerima terdaftar."
+    siap = sum(1 for r in rows if r["gd_user_id"] and r["approved"] and r["enabled"])
+    nunggu = sum(1 for r in rows if r["gd_user_id"] and not r["approved"])
+    lines = [f"👥 <b>Penerima terdaftar ({len(rows)})</b> — "
+             f"🟢 {siap} aktif · ⏳ {nunggu} nunggu approval", ""]
+    for i, r in enumerate(rows, 1):
+        nama = r["gd_name"] or r["telegram_name"] or r["telegram_chat_id"]
+        gid = (f" · GD:<code>{r['gd_user_id']}</code>" if r["gd_user_id"] else "")
+        lines.append(f"{i}. <b>{html.escape(str(nama))}</b>{gid} · "
+                     f"{_recipient_status(r)}")
+    return "\n".join(lines)
+
+
 def handle_pending_input(cfg, cache, conn, chat_id: str, text: str) -> None:
     """Teks bebas saat ada pending action. Format action:
     daftar | other | cari | comment:<taskId> | time:<taskId> |
@@ -2238,6 +2290,12 @@ def handle_message(cfg, cache, msg: dict) -> None:
         conn.commit()
         tg_send(cfg["bot_token"], chat_id,
                 "🔕 Oke, reminder dimatikan. Ketik /start kalau mau aktif lagi.")
+    elif cmd in ("/terdaftar", "/penerima"):
+        # daftar penerima terdaftar — SENSITIF, khusus admin
+        if chat_id not in cfg["admin_chat_ids"]:
+            tg_send(cfg["bot_token"], chat_id, "🔒 /terdaftar khusus admin.")
+        else:
+            tg_send(cfg["bot_token"], chat_id, recipients_text(conn))
     elif cmd == "/ai":
         # kontrol AI layer — khusus admin (PRD §6.4)
         if chat_id not in cfg["admin_chat_ids"]:

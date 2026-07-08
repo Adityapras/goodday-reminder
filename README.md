@@ -156,7 +156,12 @@ cron (`run`), terpisah dari bot.
 | `/status` | Status pendaftaran kamu |
 | `/batal` | Batalkan input yang sedang ditunggu |
 | `/berhenti` | Stop reminder pagi (`/start` untuk aktif lagi) |
+| `/terdaftar` | (khusus admin) daftar penerima yang sudah terdaftar di bot |
 | `/ai on\|off\|status` | (khusus admin) kontrol AI layer |
+
+Admin juga bisa tanya bahasa bebas ke AI (kalau AI aktif), mis. "siapa saja
+yang sudah daftar?" — AI memanggil tool `list_recipients` (admin-only; non-admin
+otomatis ditolak, data penerima tidak dibocorkan).
 
 Di group/topic: `/digest`, `/tasks`, `/status`, `/gdusers`, `/help` — bot
 membalas di topic yang sama. `/daftar` & `/berhenti` khusus DM.
