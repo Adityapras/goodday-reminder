@@ -1287,8 +1287,13 @@ def _ai_tools_spec():
             "parameters": {"type": "object", "properties": props,
                            "required": required}}}
     ref = {"type": "string",
-           "description": "Nomor #shortId atau id task (harus milik user ini)"}
+           "description": "Acuan task: #shortId, id task (mis. gKsgTP), "
+                          "atau link goodday.work/t/<id>"}
     return [
+        tool("get_task", "Ambil & baca detail sebuah task dari GoodDay (status, "
+             "tanggal, project, dll). Pakai ini kapan pun user nyebut task lewat "
+             "#shortId / id / link, termasuk task yang ga ada di daftar user.",
+             {"task_ref": ref}, ["task_ref"]),
         tool("update_status", "Ganti status sebuah task.",
              {"task_ref": ref, "status_name": {"type": "string",
               "description": "Nama status, persis salah satu dari daftar status valid"}},
@@ -1348,31 +1353,98 @@ def _ai_system_prompt(today, tasks, statuses, cfields) -> str:
     cf_block = "\n".join(cf_lines) or "(ga ada)"
     return (
         "Kamu asisten di dalam bot Telegram Opsifin, bantu user ngurus task "
-        "GoodDay mereka. Balas Bahasa Indonesia santai & singkat. Boleh HTML "
-        "Telegram sederhana (<b>) seperlunya, JANGAN markdown.\n\n"
-        "ATURAN:\n"
-        "- Kamu HANYA boleh menyentuh task milik user ini yang ada di daftar "
-        "bawah. Jangan mengarang task/angka.\n"
-        "- Untuk MELAKUKAN aksi (status, comment, report time, story point, "
-        "tanggal, custom field) WAJIB panggil tool yang sesuai. JANGAN ngaku "
-        "sudah melakukan sesuatu tanpa memanggil tool.\n"
-        "- Kalau user cuma nanya/ngobrol, jawab langsung tanpa tool.\n"
-        "- Kalau ambigu (task mana / nilai apa), tanya balik dulu, jangan nebak.\n"
-        "- Rujuk task pakai nomor #shortId.\n\n"
+        "GoodDay. Ngobrol santai, ramah, kayak rekan kerja — bukan robot. Balas "
+        "Bahasa Indonesia singkat & to the point. Boleh HTML Telegram sederhana "
+        "(<b>) seperlunya, JANGAN markdown.\n\n"
+        "CARA KERJA:\n"
+        "- Daftar 'TASK AKTIF USER' di bawah = task yang di-assign ke user (buat "
+        "jawab cepat pertanyaan umum). TAPI kamu TIDAK dibatasi cuma ke situ.\n"
+        "- Kalau user nyebut task lewat #shortId, id (mis. gKsgTP), atau link "
+        "goodday.work/t/..., LANGSUNG panggil tool get_task buat ambil detailnya "
+        "dari GoodDay — JANGAN nolak atau minta user 'sebutkan #shortId' kalau dia "
+        "udah kasih id/link. User boleh akses task apa pun by id/URL.\n"
+        "- Butuh baca isi/status task dulu sebelum jawab? Panggil get_task dulu.\n"
+        "- Untuk aksi (ganti status, comment, report time, story point, tanggal, "
+        "custom field) WAJIB panggil tool aksinya. JANGAN ngaku udah ngelakuin "
+        "sesuatu tanpa manggil tool. Boleh get_task dulu baru aksi.\n"
+        "- Kalau user cuma nanya/ngobrol, jawab langsung.\n"
+        "- Cuma tanya balik kalau BENER-BENER ambigu (mis. nilai status ga jelas). "
+        "Kalau id/link udah ada, kerjain — jangan muter-muter.\n\n"
         f"Hari ini: {today} (WIB).\n\n"
-        f"TASK AKTIF USER:\n{task_block}\n\n"
+        f"TASK AKTIF (assigned) USER:\n{task_block}\n\n"
         f"STATUS valid: {status_names}\n"
         "STORY POINTS valid: 1, 3, 5, 8, 13 (0 = hapus)\n"
         f"CUSTOM FIELD yang bisa diubah:\n{cf_block}\n")
 
 
+_GD_URL_RE = re.compile(r"goodday\.work/t/([A-Za-z0-9]+)")
+
+
+def _ai_task_ref(ref) -> str:
+    """Normalisasi acuan task: link goodday.work/t/<id>, '#123', 'gKsgTP' -> ref."""
+    s = str(ref or "").strip()
+    m = _GD_URL_RE.search(s)
+    if m:
+        return m.group(1)
+    return s.lstrip("#").strip()
+
+
+def _ai_resolve_task(cfg, row, ref):
+    """(task, err). Coba assigned-tasks user dulu; kalau ga ketemu, ambil global
+    by id lewat gd_task_detail (kebijakan: semua user ke-link boleh akses task
+    apa pun by id/URL — keputusan user 2026-07-08). err=str kalau gagal."""
+    r = _ai_task_ref(ref)
+    if not r:
+        return None, "acuan task kosong — sebut #shortId, id, atau link GoodDay."
+    owned = user_owns_task(cfg, row["gd_user_id"], r)
+    if owned:
+        return owned, None
+    try:
+        t = gd_task_detail(cfg["api_token"], r)
+    except Exception as e:
+        return None, (f"task '{html.escape(r[:24])}' ga bisa diambil dari GoodDay "
+                      f"({html.escape(str(e)[:100])}). Coba pakai id/URL task, "
+                      f"bukan #shortId numerik.")
+    if t and t.get("id"):
+        return t, None
+    return None, f"task '{html.escape(r[:24])}' ga ketemu di GoodDay."
+
+
+def _ai_task_summary(cfg, cache, t) -> str:
+    """Ringkas detail task buat dibaca AI/user."""
+    lines = [task_label(t)]
+    st = (t.get("status") or {}).get("name")
+    if st:
+        lines.append(f"🏷 Status: <b>{html.escape(st)}</b>")
+    proj = cached_projects(cfg, cache).get(str(t.get("projectId") or ""))
+    if proj:
+        lines.append(f"📁 {html.escape(proj)}")
+    sd = date_only(t.get("startDate"))
+    dl = date_only(t.get("deadline"))
+    jad = [x for x in (f"mulai {sd}" if sd else None,
+                       f"deadline {dl}" if dl else None) if x]
+    if jad:
+        lines.append("🗓 " + " → ".join(jad))
+    prio = priority_label(t.get("priority"))
+    if prio:
+        lines.append(prio)
+    tid = t.get("id")
+    if tid:
+        lines.append(GOODDAY_TASK_URL.format(task_id=tid))
+    return "\n".join(lines)
+
+
 def _ai_run_tool(cfg, row, cache, name, args) -> str:
-    """Eksekusi satu tool-call -> string hasil (HTML). Task di-resolve lewat
-    user_owns_task -> guard kepemilikan otomatis (task orang lain = ga ketemu)."""
-    ref = str(args.get("task_ref", "")).strip().lstrip("#")
-    task = user_owns_task(cfg, row["gd_user_id"], ref) if ref else None
-    if not task:
-        return f"❌ Task '{html.escape(ref[:20])}' ga ketemu di daftar task kamu."
+    """Eksekusi satu tool-call -> string hasil (HTML)."""
+    if name == "get_task":
+        task, err = _ai_resolve_task(cfg, row, args.get("task_ref"))
+        if err:
+            return f"❌ {err}"
+        return _ai_task_summary(cfg, cache, task)
+
+    task, err = _ai_resolve_task(cfg, row, args.get("task_ref"))
+    if err:
+        return f"❌ {err}"
 
     if name == "update_status":
         want = (args.get("status_name") or "").strip().lower()
