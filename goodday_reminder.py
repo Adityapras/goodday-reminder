@@ -50,6 +50,7 @@ Dependency: cuma `requests`  ->  pip install requests
 import os
 import re
 import sys
+import json
 import html
 import time
 import sqlite3
@@ -1241,23 +1242,258 @@ def ai_enabled(cfg, conn) -> bool:
     return get_setting(conn, "ai_enabled", "0") == "1" and bool(cfg["ai_api_key"])
 
 
-def ai_interpret(cfg, row, text: str):
-    """Hook AI: teks bebas user -> (nanti) LLM menerjemahkan niat -> panggil
-    fungsi act_* YANG SAMA dengan tombol -> return teks balasan HTML.
-    Return None = AI tidak paham / mati -> pemanggil fallback perilaku default.
-    KONTRAK: tidak boleh raise; tidak boleh menyentuh task selain milik `row`.
+def _ai_endpoint(cfg) -> str | None:
+    """URL /chat/completions dari base_url (OpenAI-compatible; 9router, ollama,
+    openai, dst.). None kalau endpoint ga bisa ditentukan."""
+    base = cfg["ai_base_url"].rstrip("/")
+    if not base:
+        if cfg["ai_provider"] in ("openai", ""):
+            base = "https://api.openai.com/v1"
+        else:
+            # provider self-hosted / anthropic tanpa base_url: ga didukung jalur ini.
+            # (anthropic murni butuh SDK resmi + skill claude-api — belum dipakai.)
+            return None
+    return base + "/chat/completions"
 
-    SCAFFOLD — panggilan LLM belum diimplementasi. Saat implementasi nanti:
-    - provider dibaca dari cfg: ai_provider / ai_api_key / ai_model / ai_base_url
-      (anthropic | openai | gemini | ollama | custom endpoint OpenAI-compatible)
-    - khusus provider anthropic: WAJIB baca skill `claude-api` dulu — pakai SDK
-      resmi `anthropic` (bukan requests), model & parameter jangan dari ingatan
-      (per 2026-07: default claude-opus-4-8, thinking adaptive)
-    - beri LLM konteks: daftar task user (assigned-tasks miliknya SAJA) +
-      definisi aksi; hasil intent dieksekusi via act_update_status/act_comment/
-      act_set_custom_field/act_report_time dengan guard yang sudah ada.
-    """
-    return None
+
+def _ai_chat(cfg, messages, tools):
+    """Satu ronde panggilan LLM (OpenAI-compatible chat/completions).
+    Return message dict dari choices[0].message. Boleh raise (dibungkus caller)."""
+    endpoint = _ai_endpoint(cfg)
+    if not endpoint:
+        raise RuntimeError("AI_BASE_URL kosong / provider ga didukung jalur ini")
+    payload = {
+        "model": cfg["ai_model"] or "gpt-4o-mini",
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    resp = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {cfg['ai_api_key']}",
+                 "Content-Type": "application/json"},
+        json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]
+
+
+def _ai_tools_spec():
+    """Definisi tool (function-calling) — memetakan niat LLM ke fungsi act_*."""
+    def tool(name, desc, props, required):
+        return {"type": "function", "function": {
+            "name": name, "description": desc,
+            "parameters": {"type": "object", "properties": props,
+                           "required": required}}}
+    ref = {"type": "string",
+           "description": "Nomor #shortId atau id task (harus milik user ini)"}
+    return [
+        tool("update_status", "Ganti status sebuah task.",
+             {"task_ref": ref, "status_name": {"type": "string",
+              "description": "Nama status, persis salah satu dari daftar status valid"}},
+             ["task_ref", "status_name"]),
+        tool("add_comment", "Kirim comment ke sebuah task.",
+             {"task_ref": ref, "message": {"type": "string"}},
+             ["task_ref", "message"]),
+        tool("report_time", "Catat waktu kerja (menit) ke sebuah task.",
+             {"task_ref": ref,
+              "minutes": {"type": "integer", "description": "Durasi dalam menit"},
+              "note": {"type": "string", "description": "Catatan opsional"}},
+             ["task_ref", "minutes"]),
+        tool("set_story_points", "Set story points task (1/3/5/8/13, 0 = hapus).",
+             {"task_ref": ref,
+              "points": {"type": "integer", "enum": [0, 1, 3, 5, 8, 13]}},
+             ["task_ref", "points"]),
+        tool("set_dates", "Set start & end date task (format YYYY-MM-DD).",
+             {"task_ref": ref, "start_date": {"type": "string"},
+              "end_date": {"type": "string"}},
+             ["task_ref", "start_date", "end_date"]),
+        tool("set_custom_field", "Ubah custom field task (yang ada di daftar).",
+             {"task_ref": ref, "field_name": {"type": "string"},
+              "value": {"type": "string"}},
+             ["task_ref", "field_name", "value"]),
+    ]
+
+
+def _ai_system_prompt(today, tasks, statuses, cfields) -> str:
+    lines = []
+    for t in tasks[:60]:
+        st = (t.get("status") or {}).get("name") or "?"
+        extra = []
+        sd = date_only(t.get("startDate"))
+        dl = date_only(t.get("deadline"))
+        if sd:
+            extra.append(f"mulai {sd}")
+        if dl:
+            extra.append(f"deadline {dl}")
+        lines.append(f"- #{t.get('shortId')} (id {t.get('id')}): "
+                     f"{t.get('name') or '(tanpa judul)'} [status: {st}]"
+                     + (" · " + ", ".join(extra) if extra else ""))
+    task_block = "\n".join(lines) or "(kamu lagi ga punya task aktif)"
+    status_names = ", ".join(s.get("name") for s in statuses
+                             if s.get("name")) or "(ga ada)"
+    cf_lines = []
+    for f in cfields.values():
+        nm = f.get("name") or f.get("id")
+        if f.get("type") == 23:
+            cf_lines.append(f"- {nm} (checkbox: ya/tidak)")
+        else:
+            items = (f.get("params") or {}).get("listItems") or []
+            if items:
+                cf_lines.append(f"- {nm} (pilihan: "
+                                + ", ".join(str(i.get('value')) for i in items) + ")")
+            else:
+                cf_lines.append(f"- {nm} (teks)")
+    cf_block = "\n".join(cf_lines) or "(ga ada)"
+    return (
+        "Kamu asisten di dalam bot Telegram Opsifin, bantu user ngurus task "
+        "GoodDay mereka. Balas Bahasa Indonesia santai & singkat. Boleh HTML "
+        "Telegram sederhana (<b>) seperlunya, JANGAN markdown.\n\n"
+        "ATURAN:\n"
+        "- Kamu HANYA boleh menyentuh task milik user ini yang ada di daftar "
+        "bawah. Jangan mengarang task/angka.\n"
+        "- Untuk MELAKUKAN aksi (status, comment, report time, story point, "
+        "tanggal, custom field) WAJIB panggil tool yang sesuai. JANGAN ngaku "
+        "sudah melakukan sesuatu tanpa memanggil tool.\n"
+        "- Kalau user cuma nanya/ngobrol, jawab langsung tanpa tool.\n"
+        "- Kalau ambigu (task mana / nilai apa), tanya balik dulu, jangan nebak.\n"
+        "- Rujuk task pakai nomor #shortId.\n\n"
+        f"Hari ini: {today} (WIB).\n\n"
+        f"TASK AKTIF USER:\n{task_block}\n\n"
+        f"STATUS valid: {status_names}\n"
+        "STORY POINTS valid: 1, 3, 5, 8, 13 (0 = hapus)\n"
+        f"CUSTOM FIELD yang bisa diubah:\n{cf_block}\n")
+
+
+def _ai_run_tool(cfg, row, cache, name, args) -> str:
+    """Eksekusi satu tool-call -> string hasil (HTML). Task di-resolve lewat
+    user_owns_task -> guard kepemilikan otomatis (task orang lain = ga ketemu)."""
+    ref = str(args.get("task_ref", "")).strip().lstrip("#")
+    task = user_owns_task(cfg, row["gd_user_id"], ref) if ref else None
+    if not task:
+        return f"❌ Task '{html.escape(ref[:20])}' ga ketemu di daftar task kamu."
+
+    if name == "update_status":
+        want = (args.get("status_name") or "").strip().lower()
+        opts = cached_statuses(cfg, cache)
+        s = next((x for x in opts
+                  if (x.get("name") or "").strip().lower() == want), None)
+        if not s:
+            s = next((x for x in opts
+                      if want and want in (x.get("name") or "").strip().lower()), None)
+        if not s:
+            names = ", ".join(x.get("name") for x in opts if x.get("name"))
+            return f"❌ Status '{args.get('status_name')}' ga dikenal. Pilihan: {names}"
+        return act_update_status(cfg, row, task, str(s.get("id")), s.get("name"))
+
+    if name == "add_comment":
+        msg = (args.get("message") or "").strip()
+        if not msg:
+            return "❌ Isi comment kosong."
+        return act_comment(cfg, row, task, msg)
+
+    if name == "report_time":
+        try:
+            minutes = int(args.get("minutes"))
+        except (TypeError, ValueError):
+            return "❌ minutes harus angka (menit)."
+        if minutes <= 0:
+            return "❌ minutes harus > 0."
+        return act_report_time(cfg, row, task, minutes,
+                               (args.get("note") or "").strip())
+
+    if name == "set_story_points":
+        raw = args.get("points")
+        points = None if raw in (0, "0", "-", None, "") else int(raw)
+        return act_set_story_points(cfg, row, task, points)
+
+    if name == "set_dates":
+        sd = parse_date_token(str(args.get("start_date", "")))
+        ed = parse_date_token(str(args.get("end_date", "")
+                                  or args.get("start_date", "")))
+        if not sd or not ed:
+            return "❌ Format tanggal harus YYYY-MM-DD."
+        if ed < sd:
+            return "❌ end_date ga boleh sebelum start_date."
+        return act_set_dates(cfg, row, task, sd, ed)
+
+    if name == "set_custom_field":
+        fields = cached_custom_fields(cfg, cache)
+        fname = (args.get("field_name") or "").strip().lower()
+        field = next((f for f in fields.values()
+                      if (f.get("name") or "").strip().lower() == fname), None)
+        if not field:
+            names = ", ".join(f.get("name") for f in fields.values() if f.get("name"))
+            return (f"❌ Custom field '{args.get('field_name')}' ga ada / di luar "
+                    f"whitelist. Pilihan: {names or '(ga ada)'}")
+        raw = args.get("value")
+        if field.get("type") == 23:  # checkbox -> boolean asli
+            on = str(raw).strip().lower() in ("1", "true", "ya", "yes", "centang",
+                                              "on", "✓")
+            return act_set_custom_field(cfg, row, task, field, on,
+                                        "✓ dicentang" if on else "✗ tanpa centang")
+        items = (field.get("params") or {}).get("listItems") or []
+        if items:  # dropdown -> value = id item
+            it = next((x for x in items
+                       if str(x.get("value")).strip().lower()
+                       == str(raw).strip().lower()), None)
+            if not it:
+                opts = ", ".join(str(x.get("value")) for x in items)
+                return f"❌ Nilai '{raw}' ga ada buat {field.get('name')}. Pilihan: {opts}"
+            return act_set_custom_field(cfg, row, task, field,
+                                        int(it.get("id")), str(it.get("value")))
+        return act_set_custom_field(cfg, row, task, field, raw, str(raw))
+
+    return f"❌ Tool '{name}' ga dikenal."
+
+
+def ai_interpret(cfg, row, text: str, cache=None):
+    """Hook AI: teks bebas user -> LLM (via 9router/OpenAI-compatible) -> tool-call
+    -> fungsi act_* YANG SAMA dengan tombol -> return teks balasan HTML.
+    Return None = AI tidak paham -> pemanggil fallback perilaku default.
+    KONTRAK: tidak boleh raise; tidak boleh menyentuh task selain milik `row`
+    (dijamin lewat user_owns_task di _ai_run_tool)."""
+    if cache is None:
+        cache = {}
+    if not row or not row["gd_user_id"]:
+        return None
+    try:
+        today = today_str()
+        tasks = gd_assigned_tasks(cfg["api_token"], row["gd_user_id"])
+        statuses = cached_statuses(cfg, cache)
+        cfields = cached_custom_fields(cfg, cache)
+        messages = [
+            {"role": "system",
+             "content": _ai_system_prompt(today, tasks, statuses, cfields)},
+            {"role": "user", "content": text},
+        ]
+        tools = _ai_tools_spec()
+        act_results = []
+        for _ in range(5):  # batas ronde tool-call
+            msg = _ai_chat(cfg, messages, tools)
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                final = (msg.get("content") or "").strip()
+                if act_results:
+                    return "\n".join(act_results) + (("\n\n" + final) if final else "")
+                return final or None
+            messages.append({"role": "assistant",
+                             "content": msg.get("content"), "tool_calls": calls})
+            for c in calls:
+                fn = c.get("function") or {}
+                try:
+                    a = json.loads(fn.get("arguments") or "{}")
+                except (ValueError, TypeError):
+                    a = {}
+                result = _ai_run_tool(cfg, row, cache, fn.get("name"), a)
+                act_results.append(result)
+                messages.append({"role": "tool", "tool_call_id": c.get("id"),
+                                 "content": result})
+        return "\n".join(act_results) if act_results else None
+    except Exception as e:  # kontrak: AI gagal ga boleh mecahin bot
+        print(f"  ! ai_interpret LLM error: {e}", file=sys.stderr)
+        return f"⚠️ AI lagi ga bisa dipanggil: {html.escape(str(e)[:150])}"
 
 
 # skala story point yang dipakai tim (fibonacci) — keputusan user 2026-07-07
@@ -1742,7 +1978,7 @@ def handle_message(cfg, cache, msg: dict) -> None:
         reply = None
         if not cmd.startswith("/") and ai_enabled(cfg, conn):
             try:
-                reply = ai_interpret(cfg, get_recipient(conn, chat_id), text)
+                reply = ai_interpret(cfg, get_recipient(conn, chat_id), text, cache)
             except Exception as e:  # kontrak: AI gagal ga boleh mecahin bot
                 print(f"  ! ai_interpret error: {e}", file=sys.stderr)
                 reply = None
