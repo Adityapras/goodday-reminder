@@ -570,22 +570,21 @@ def _num_eq(a, b) -> bool:
         return str(a) == str(b)
 
 
-def need_sp_ids(cfg, cache) -> set:
+def need_sp_ids(cfg, cache=None) -> set:
     """Set task-id yang MASIH bertag 'need-story-point' (READY_NEED_SP_TAG).
-    Sekali fetch per CACHE_TTL. Gagal fetch -> set kosong: kriteria SP dianggap
+    SELALU fetch fresh (keputusan user 2026-07-08: cek kesiapan real-time — biar
+    story point yang baru diisi di GoodDay langsung kelihatan, ga nunggu cache).
+    1 call ringan per pemanggilan. Gagal fetch -> set kosong: kriteria SP dianggap
     lolos, biar ga bikin SEMUA task ke-cap 'belum siap' cuma gara-gara API error."""
     tag = cfg.get("ready_need_sp_tag")
     if not tag:
         return set()
-    if "need_sp" not in cache or time.time() - cache.get("need_sp_ts", 0) > CACHE_TTL:
-        try:
-            tasks = gd_tag_tasks(cfg["api_token"], tag)
-            cache["need_sp"] = {str(t.get("id")) for t in tasks if t.get("id")}
-        except Exception as e:
-            print(f"  ! fetch tag {tag} (need-story-point) gagal: {e}", file=sys.stderr)
-            cache["need_sp"] = set()
-        cache["need_sp_ts"] = time.time()
-    return cache["need_sp"]
+    try:
+        tasks = gd_tag_tasks(cfg["api_token"], tag)
+        return {str(t.get("id")) for t in tasks if t.get("id")}
+    except Exception as e:
+        print(f"  ! fetch tag {tag} (need-story-point) gagal: {e}", file=sys.stderr)
+        return set()
 
 
 def task_ready(cfg, detail: dict, need_sp: set):
@@ -612,13 +611,15 @@ def mark_ready(cfg, tasks: list, today: str, cache: dict) -> None:
     """Tempelkan t['_ready'] & t['_why'] ke task yang bakal ditampilkan (hari
     ini + telat ≤ OVERDUE_WINDOW_DAYS + akan datang ≤ UPCOMING_WINDOW_DAYS) —
     sama persis dgn jendela split_tasks, jadi ga buang kuota API buat task yang
-    toh disembunyikan. Detail di-cache biar /tasks berulang ga nembak API terus.
+    toh disembunyikan. Detail SELALU di-fetch fresh (keputusan user 2026-07-08:
+    /tasks real-time, TIDAK di-cache — biar perubahan di GoodDay, mis. Product
+    Stream / story point, langsung kelihatan tanpa nunggu TTL). Task sudah
+    difilter ke jendela sempit jadi cuma segelintir GET /task/{id} per user.
     Gagal fetch = tanpa label (bukan error)."""
     need_sp = need_sp_ids(cfg, cache)
     today_d = date.fromisoformat(today)
     lo = (today_d - timedelta(days=OVERDUE_WINDOW_DAYS)).isoformat()
     hi = (today_d + timedelta(days=UPCOMING_WINDOW_DAYS)).isoformat()
-    store = cache.setdefault("ready", {})
     for t in tasks:
         sd, dl = date_only(t.get("startDate")), date_only(t.get("deadline"))
         relevant = (sd == today or dl == today
@@ -630,16 +631,11 @@ def mark_ready(cfg, tasks: list, today: str, cache: dict) -> None:
         tid = t.get("id")
         if not tid:
             continue
-        hit = store.get(tid)
-        if hit and time.time() - hit[0] <= CACHE_TTL:
-            t["_ready"], t["_why"] = hit[1], hit[2]
-            continue
         try:
             ready, why = task_ready(cfg, gd_task_detail(cfg["api_token"], tid), need_sp)
         except Exception as e:
             print(f"  ! ready-check {tid} gagal: {e}", file=sys.stderr)
             continue
-        store[tid] = (time.time(), ready, why)
         t["_ready"], t["_why"] = ready, why
 
 
