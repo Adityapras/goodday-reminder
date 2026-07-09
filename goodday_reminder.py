@@ -367,18 +367,57 @@ def tg_send(bot_token: str, chat_id: str, text: str, reply_markup: dict | None =
 # GoodDay API
 # ---------------------------------------------------------------------------
 
+GD_RETRIES = 2            # retry ekstra buat error transien (5xx / koneksi putus)
+GD_RETRY_BACKOFF = 1.5    # detik dasar; dikali (attempt+1) tiap ulangan
+GD_TRANSIENT = (502, 503, 504)  # gateway/overload GoodDay -> layak diulang
+
+
+class GoodDayError(Exception):
+    """Panggilan API GoodDay gagal dengan cara yang bisa dilaporkan ke user.
+    `.user_message` = teks ramah yang aman dikirim ke Telegram (bukan traceback).
+    Sengaja turunan Exception (bukan SystemExit) supaya kegagalan API TIDAK
+    pernah mematikan proses bot — cukup dilaporkan lalu bot lanjut."""
+
+    def __init__(self, message: str, user_message: str):
+        super().__init__(message)
+        self.user_message = user_message
+
+
 def gd_get(path: str, api_token: str, params: dict | None = None):
     url = f"{GOODDAY_BASE_URL}/{path.lstrip('/')}"
-    resp = requests.get(
-        url,
-        headers={"gd-api-token": api_token, "Content-Type": "application/json"},
-        params=params,
-        timeout=HTTP_TIMEOUT,
-    )
-    if resp.status_code == 401:
-        raise SystemExit("GoodDay nolak token (401). Cek GOODDAY_API_TOKEN.")
-    resp.raise_for_status()
-    return resp.json()
+    headers = {"gd-api-token": api_token, "Content-Type": "application/json"}
+    for attempt in range(GD_RETRIES + 1):
+        last = attempt == GD_RETRIES
+        try:
+            resp = requests.get(url, headers=headers, params=params,
+                                timeout=HTTP_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            # koneksi putus / timeout -> transien, ulangi
+            if not last:
+                time.sleep(GD_RETRY_BACKOFF * (attempt + 1))
+                continue
+            raise GoodDayError(
+                f"GoodDay tak bisa dihubungi ({url}): {e}",
+                "⚠️ GoodDay lagi ga bisa dihubungi (koneksi gagal). "
+                "Coba lagi beberapa menit ya.")
+        if resp.status_code == 401:
+            # token ditolak: dulu `raise SystemExit` -> MEMATIKAN bot. Sekarang
+            # dilaporkan ke user & admin tanpa menjatuhkan proses.
+            raise GoodDayError(
+                "GoodDay nolak token (401). Cek GOODDAY_API_TOKEN.",
+                "🔒 Token GoodDay ditolak (401). Ada yang salah di konfigurasi — "
+                "tolong kabari admin ya.")
+        if resp.status_code in GD_TRANSIENT:
+            if not last:
+                time.sleep(GD_RETRY_BACKOFF * (attempt + 1))
+                continue
+            raise GoodDayError(
+                f"GoodDay error transien: HTTP {resp.status_code} ({url})",
+                f"⚠️ GoodDay lagi bermasalah (server mereka balikin error "
+                f"{resp.status_code}). Ini gangguan sementara di sisi GoodDay, "
+                "bukan di bot — coba lagi beberapa menit ya.")
+        resp.raise_for_status()
+        return resp.json()
 
 
 def gd_write(method: str, path: str, api_token: str, payload: dict):
@@ -1880,6 +1919,23 @@ def require_self(cfg, user_key: str):
     return row, None
 
 
+def notify_gd_error(cfg, update: dict, user_message: str) -> None:
+    """Kabari chat asal update kalau panggilan GoodDay gagal (best-effort).
+    Sengaja ditelan di dalam sini: gagal kirim notifikasi ga boleh bikin loop
+    update ikut mati. Chat + topic diambil dari message/callback aslinya, jadi
+    balasannya nyampe ke tempat yang sama dgn perintahnya (DM atau group/topic)."""
+    try:
+        msg = (update.get("message")
+               or (update.get("callback_query") or {}).get("message") or {})
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
+        if not chat_id:
+            return
+        tg_send(cfg["bot_token"], chat_id, user_message,
+                thread_id=msg.get("message_thread_id"))
+    except Exception as e:
+        print(f"  ! gagal kirim notifikasi error GoodDay: {e}", file=sys.stderr)
+
+
 def notify_admins(cfg, text: str, kb: dict | None = None) -> None:
     for admin_id in cfg["admin_chat_ids"]:
         try:
@@ -2738,6 +2794,10 @@ def cmd_bot(cfg, args):
                     handle_message(cfg, cache, up["message"])
                 elif "callback_query" in up:
                     handle_callback(cfg, cache, up["callback_query"])
+            except GoodDayError as e:
+                # API GoodDay ngadat (mis. 502) -> kabari user, JANGAN diam.
+                print(f"  ! GoodDay error: {e}", file=sys.stderr)
+                notify_gd_error(cfg, up, e.user_message)
             except Exception as e:
                 print(f"  ! error proses update: {e}", file=sys.stderr)
 
@@ -2798,11 +2858,16 @@ def main():
         "digest": cmd_digest,
         "bot": cmd_bot,
     }
-    if args.command == "enable":
-        return cmd_toggle(cfg, args, 1)
-    if args.command == "disable":
-        return cmd_toggle(cfg, args, 0)
-    dispatch[args.command](cfg, args)
+    try:
+        if args.command == "enable":
+            return cmd_toggle(cfg, args, 1)
+        if args.command == "disable":
+            return cmd_toggle(cfg, args, 0)
+        dispatch[args.command](cfg, args)
+    except GoodDayError as e:
+        # di CLI: keluar rapi (pesan, exit 1) — bukan traceback. Di mode `bot`
+        # error ini sudah ditangani per-update, jadi ga sampai ke sini.
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
